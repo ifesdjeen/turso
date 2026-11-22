@@ -1622,7 +1622,17 @@ impl BuildSharedWal {
                     if !c.succeeded() {
                         io_yield_one!(c);
                     }
-                    self.phase = BuildSharedWalPhase::ChunkLoop;
+                    let reader = self
+                        .reader
+                        .as_ref()
+                        .expect("reader must exist outside the Done phase");
+                    self.phase = if !reader.done.load(Ordering::Acquire)
+                        && reader.off_atomic.load(Ordering::Acquire) < WAL_HEADER_SIZE as u64
+                    {
+                        BuildSharedWalPhase::NeedHeaderRead
+                    } else {
+                        BuildSharedWalPhase::ChunkLoop
+                    };
                 }
                 BuildSharedWalPhase::ChunkLoop => {
                     let reader = self
@@ -1693,6 +1703,7 @@ pub(super) struct StreamingWalReader {
 
 /// Mutable state for streaming reader
 struct StreamingState {
+    header_buf: [u8; WAL_HEADER_SIZE],
     frame_idx: u64,
     cumulative_checksum: (u32, u32),
     /// checksum of the last valid commit frame
@@ -1720,6 +1731,7 @@ impl StreamingWalReader {
             page_atomic: AtomicU64::new(0),
             done: AtomicBool::new(false),
             state: RwLock::new(StreamingState {
+                header_buf: [0; WAL_HEADER_SIZE],
                 frame_idx: 1,
                 cumulative_checksum: (0, 0),
                 last_valid_checksum: (0, 0),
@@ -1733,7 +1745,8 @@ impl StreamingWalReader {
     }
 
     fn read_header(self: Arc<Self>) -> crate::Result<Completion> {
-        let header_buf = Arc::new(Buffer::new_temporary(WAL_HEADER_SIZE));
+        let offset = self.off_atomic.load(Ordering::Acquire);
+        let header_buf = Arc::new(Buffer::new_temporary(WAL_HEADER_SIZE - offset as usize));
         let reader = self.clone();
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let _reader = reader.clone();
@@ -1741,7 +1754,7 @@ impl StreamingWalReader {
             None
         });
         let c = Completion::new_read(header_buf, completion);
-        self.file.pread(0, c)
+        self.file.pread(offset, c)
     }
 
     fn submit_one_chunk(self: Arc<Self>, offset: u64) -> crate::Result<(usize, Completion)> {
@@ -1785,14 +1798,23 @@ impl StreamingWalReader {
             self.finalize_loading();
             return;
         };
-        if bytes_read != WAL_HEADER_SIZE as i32 {
+        if bytes_read == 0 {
             self.finalize_loading();
+            return;
+        }
+
+        let mut st = self.state.write();
+        let offset = self.off_atomic.load(Ordering::Acquire) as usize;
+        let end = offset + bytes_read as usize;
+        st.header_buf[offset..end].copy_from_slice(&buf.as_slice()[..bytes_read as usize]);
+        self.off_atomic.store(end as u64, Ordering::Release);
+        if end < WAL_HEADER_SIZE {
             return;
         }
 
         let (page_sz, c1, c2, use_native, ok) = {
             let mut h = self.header.lock();
-            let s = buf.as_slice();
+            let s = &st.header_buf;
             h.magic = u32::from_be_bytes(s[0..4].try_into().unwrap());
             h.file_format = u32::from_be_bytes(s[4..8].try_into().unwrap());
             h.page_size = u32::from_be_bytes(s[8..12].try_into().unwrap());
@@ -1830,19 +1852,15 @@ impl StreamingWalReader {
         }
         if PageSize::new(page_sz).is_none() || !ok {
             *self.header.lock() = WalHeader::default();
+            drop(st);
             self.finalize_loading();
             return;
         }
-        {
-            let mut st = self.state.write();
-            st.page_size = page_sz as usize;
-            st.use_native_endian = use_native;
-            st.cumulative_checksum = (c1, c2);
-            st.last_valid_checksum = (c1, c2);
-            st.header_valid = true;
-        }
-        self.off_atomic
-            .store(WAL_HEADER_SIZE as u64, Ordering::Release);
+        st.page_size = page_sz as usize;
+        st.use_native_endian = use_native;
+        st.cumulative_checksum = (c1, c2);
+        st.last_valid_checksum = (c1, c2);
+        st.header_valid = true;
         self.page_atomic.store(page_sz as u64, Ordering::Release);
     }
 

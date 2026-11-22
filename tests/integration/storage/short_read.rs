@@ -234,3 +234,61 @@ fn test_zeroed_page_returns_corrupt_error() {
             .contains("Invalid page type: 0");
     }
 }
+
+#[test]
+fn test_wal_header_short_reads_preserve_committed_rows() {
+    use crate::queued_io::QueuedIo;
+    use std::sync::Arc;
+    use turso_core::{Buffer, Completion, Database, OpenFlags, OpenOptions, IO};
+    use turso_sqlite::SqliteDialect;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.db");
+    let source = rusqlite::Connection::open(&source_path).unwrap();
+    source
+        .execute_batch(
+            "PRAGMA page_size=512;
+             PRAGMA journal_mode=WAL;
+             CREATE TABLE t(x);
+             PRAGMA wal_checkpoint(TRUNCATE);
+             INSERT INTO t VALUES (1);
+             INSERT INTO t VALUES (2);",
+        )
+        .unwrap();
+    let db_bytes = std::fs::read(&source_path).unwrap();
+    let wal_bytes = std::fs::read(dir.path().join("source.db-wal")).unwrap();
+
+    for limit in 1..=32 {
+        let io = Arc::new(QueuedIo::new());
+        let path = dir.path().join(format!("short-{limit}.db"));
+        let path = path.to_str().unwrap();
+        for (name, bytes) in [
+            (path.to_owned(), &db_bytes),
+            (format!("{path}-wal"), &wal_bytes),
+        ] {
+            let file = io.open_file(&name, OpenFlags::Create, false).unwrap();
+            let c = file
+                .pwrite(
+                    0,
+                    Arc::new(Buffer::new(bytes.clone())),
+                    Completion::new_write(|_| {}),
+                )
+                .unwrap();
+            io.wait_for_completion(c).unwrap();
+        }
+        io.limit_wal_header_reads(limit);
+        let db = Database::open(io, path, OpenOptions::new(Arc::new(SqliteDialect))).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let mut rows = Vec::new();
+        conn.prepare("SELECT x FROM t ORDER BY x")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                rows.push(row.get::<i64>(0)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, vec![1, 2], "WAL header read limit {limit}");
+    }
+}

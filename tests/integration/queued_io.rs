@@ -87,6 +87,7 @@ struct QueuedIoState {
     owner: Mutex<String>,
     ordinals: Mutex<HashMap<String, u32>>,
     fail_next: Mutex<Option<QueuedIoOpKind>>,
+    wal_header_read_limit: Mutex<Option<usize>>,
 }
 
 impl QueuedIoState {
@@ -99,6 +100,7 @@ impl QueuedIoState {
             owner: Mutex::new("unowned".to_string()),
             ordinals: Mutex::new(HashMap::new()),
             fail_next: Mutex::new(None),
+            wal_header_read_limit: Mutex::new(None),
         }
     }
 }
@@ -118,6 +120,11 @@ impl QueuedIo {
             inner,
             state: Arc::new(QueuedIoState::new()),
         }
+    }
+
+    pub(crate) fn limit_wal_header_reads(&self, bytes: usize) {
+        assert!(bytes > 0);
+        *self.state.wal_header_read_limit.lock().unwrap() = Some(bytes);
     }
 
     pub(crate) fn step_one(&self) -> turso_core::Result<Option<QueuedIoEvent>> {
@@ -430,8 +437,30 @@ impl File for QueuedFile {
         let inner = self.inner.clone();
         let c = completion.clone();
         let len = completion.as_read().buf().len();
+        let limit = if self.path.ends_with("-wal") {
+            *self.state.wal_header_read_limit.lock().unwrap()
+        } else {
+            None
+        };
         self.enqueue(QueuedIoOpKind::Pread, pos, len, completion, move || {
-            drop(inner.pread(pos, c)?);
+            if let Some(limit) = limit.filter(|_| pos < 32) {
+                let len = c.as_read().buf().len().min(limit);
+                let buf = Arc::new(Buffer::new_temporary(len));
+                let read = Completion::new_read(buf, move |res| {
+                    match res {
+                        Ok((buf, n)) => {
+                            c.as_read().buf().as_mut_slice()[..n as usize]
+                                .copy_from_slice(&buf.as_slice()[..n as usize]);
+                            c.complete(n);
+                        }
+                        Err(err) => c.error(err),
+                    }
+                    None
+                });
+                drop(inner.pread(pos, read)?);
+            } else {
+                drop(inner.pread(pos, c)?);
+            }
             Ok(())
         })
     }
